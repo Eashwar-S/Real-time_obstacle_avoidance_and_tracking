@@ -12,12 +12,10 @@ class DijkstraPlanner(Node):
     def __init__(self):
         super().__init__('dijkstra_planner')
 
-        # how many pixels per grid cell when we draw
-        self.scale = 10  
+        self.scale = 10
         self.window_name = 'Dijkstra Path'
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
 
-        # ROS subscribers / publishers
         self.create_subscription(OccupancyGrid, 'occupancy_grid', self.grid_callback, 10)
         self.path_pub = self.create_publisher(Path, 'planned_path', 10)
 
@@ -26,16 +24,25 @@ class DijkstraPlanner(Node):
         res    = msg.info.resolution
         data   = np.array(msg.data, dtype=np.int8).reshape((h, w))
 
-        # build cost map & run Dijkstra
         cost   = np.where(data > 50, np.inf, 1.0)
         start  = (h//2, 0)
         goal   = (h//2, w-1)
         path   = self.compute_dijkstra(cost, start, goal)
 
-        # publish nav_msgs/Path if found
         if path is None:
             self.get_logger().warn('No path found')
         else:
+            # ---- PRINT THE PATH ----
+            print(f"Grid indices (row, col): {path}")
+            world_pts = [
+                (
+                    msg.info.origin.position.x + (c + 0.5) * res,
+                    msg.info.origin.position.y + (r + 0.5) * res
+                )
+                for (r, c) in path
+            ]
+            print(f"World setpoints (x, y): {world_pts}")
+
             path_msg = Path()
             path_msg.header = msg.header
             for (r, c) in path:
@@ -47,23 +54,16 @@ class DijkstraPlanner(Node):
                 path_msg.poses.append(pose)
             self.path_pub.publish(path_msg)
 
-        # --- OpenCV visualization ---
-        # free = white (255), occ = black (0)
+        # --- OpenCV visualization (unchanged) ---
         occ_img = (data <= 50).astype(np.uint8) * 255
-        disp    = cv2.resize(
-            occ_img,
-            (w * self.scale, h * self.scale),
-            interpolation=cv2.INTER_NEAREST
-        )
+        disp    = cv2.resize(occ_img, (w*self.scale, h*self.scale),
+                             interpolation=cv2.INTER_NEAREST)
         disp_color = cv2.cvtColor(disp, cv2.COLOR_GRAY2BGR)
 
-        # overlay the path in red
         if path:
-            pts = np.array([
-                ((c + 0.5) * self.scale, (r + 0.5) * self.scale)
-                for (r, c) in path
-            ], dtype=np.int32).reshape(-1, 1, 2)
-            cv2.polylines(disp_color, [pts], False, (0, 0, 255), thickness=2)
+            pts = np.array([((c+0.5)*self.scale, (r+0.5)*self.scale)
+                            for (r, c) in path], dtype=np.int32).reshape(-1,1,2)
+            cv2.polylines(disp_color, [pts], False, (0,0,255), 2)
 
         cv2.imshow(self.window_name, disp_color)
         cv2.waitKey(1)
@@ -83,7 +83,7 @@ class DijkstraPlanner(Node):
             if d > dist[r, c]:
                 continue
             for dr, dc in dirs:
-                nr, nc = r + dr, c + dc
+                nr, nc = r+dr, c+dc
                 if 0 <= nr < h and 0 <= nc < w and cost[nr, nc] < np.inf:
                     nd = d + cost[nr, nc]
                     if nd < dist[nr, nc]:
@@ -94,13 +94,13 @@ class DijkstraPlanner(Node):
         if dist[goal] == np.inf:
             return None
 
-        # back‐track
         path = [goal]
         cur  = goal
         while cur != start:
             cur = prev[cur]
             path.append(cur)
         return list(reversed(path))
+
 
 def main():
     rclpy.init()
