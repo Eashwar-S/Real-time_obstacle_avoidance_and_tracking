@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+
+import rclpy
+from rclpy.node import Node
+from nav_msgs.msg import OccupancyGrid, Path
+from geometry_msgs.msg import PoseStamped
+import numpy as np
+import heapq
+import cv2
+
+class DijkstraPlanner(Node):
+    def __init__(self):
+        super().__init__('dijkstra_planner')
+
+        # how many pixels per grid cell when we draw
+        self.scale = 10  
+        self.window_name = 'Dijkstra Path'
+        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+
+        # ROS subscribers / publishers
+        self.create_subscription(OccupancyGrid, 'occupancy_grid', self.grid_callback, 10)
+        self.path_pub = self.create_publisher(Path, 'planned_path', 10)
+
+    def grid_callback(self, msg: OccupancyGrid):
+        h, w   = msg.info.height, msg.info.width
+        res    = msg.info.resolution
+        data   = np.array(msg.data, dtype=np.int8).reshape((h, w))
+
+        # build cost map & run Dijkstra
+        cost   = np.where(data > 50, np.inf, 1.0)
+        start  = (h//2, 0)
+        goal   = (h//2, w-1)
+        path   = self.compute_dijkstra(cost, start, goal)
+
+        # publish nav_msgs/Path if found
+        if path is None:
+            self.get_logger().warn('No path found')
+        else:
+            path_msg = Path()
+            path_msg.header = msg.header
+            for (r, c) in path:
+                pose = PoseStamped()
+                pose.header = msg.header
+                pose.pose.position.x = msg.info.origin.position.x + (c + 0.5) * res
+                pose.pose.position.y = msg.info.origin.position.y + (r + 0.5) * res
+                pose.pose.orientation.w = 1.0
+                path_msg.poses.append(pose)
+            self.path_pub.publish(path_msg)
+
+        # --- OpenCV visualization ---
+        # free = white (255), occ = black (0)
+        occ_img = (data <= 50).astype(np.uint8) * 255
+        disp    = cv2.resize(
+            occ_img,
+            (w * self.scale, h * self.scale),
+            interpolation=cv2.INTER_NEAREST
+        )
+        disp_color = cv2.cvtColor(disp, cv2.COLOR_GRAY2BGR)
+
+        # overlay the path in red
+        if path:
+            pts = np.array([
+                ((c + 0.5) * self.scale, (r + 0.5) * self.scale)
+                for (r, c) in path
+            ], dtype=np.int32).reshape(-1, 1, 2)
+            cv2.polylines(disp_color, [pts], False, (0, 0, 255), thickness=2)
+
+        cv2.imshow(self.window_name, disp_color)
+        cv2.waitKey(1)
+
+    def compute_dijkstra(self, cost, start, goal):
+        h, w = cost.shape
+        dist = np.full((h, w), np.inf, dtype=float)
+        prev = {}
+        dist[start] = 0.0
+        pq = [(0.0, start)]
+        dirs = [(-1,0),(1,0),(0,-1),(0,1)]
+
+        while pq:
+            d, (r, c) = heapq.heappop(pq)
+            if (r, c) == goal:
+                break
+            if d > dist[r, c]:
+                continue
+            for dr, dc in dirs:
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < h and 0 <= nc < w and cost[nr, nc] < np.inf:
+                    nd = d + cost[nr, nc]
+                    if nd < dist[nr, nc]:
+                        dist[nr, nc] = nd
+                        prev[(nr, nc)] = (r, c)
+                        heapq.heappush(pq, (nd, (nr, nc)))
+
+        if dist[goal] == np.inf:
+            return None
+
+        # back‐track
+        path = [goal]
+        cur  = goal
+        while cur != start:
+            cur = prev[cur]
+            path.append(cur)
+        return list(reversed(path))
+
+def main():
+    rclpy.init()
+    node = DijkstraPlanner()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cv2.destroyAllWindows()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
