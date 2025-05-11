@@ -4,7 +4,7 @@ This project implements real-time obstacle avoidance and tracking for drones usi
 
 ## Dependencies
 
-To run this project, you need the following dependencies:
+To run this project, you need the following dependenciess:
 
 1. **ROS 2**: Install ROS 2 (e.g., Humble or Foxy) on your system. Follow the [official installation guide](https://docs.ros.org/en/rolling/Installation.html).
 2. **Python Packages**:

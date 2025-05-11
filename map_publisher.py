@@ -110,7 +110,7 @@ class OccupancyPublisher(Node):
                     pts = pts[idx]
 
                 # subtract drone XY position and drop Z
-                body_xy = pts[:, :2] - self.drone_pos[:2]
+                body_xy = pts[:, :2]# - self.drone_pos[:2]
 
                 # compute yaw from quaternion
                 w, x, y, z = self.att_q
