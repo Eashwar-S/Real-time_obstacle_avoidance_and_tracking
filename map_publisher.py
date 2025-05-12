@@ -12,7 +12,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from sensor_msgs.msg import PointCloud2
 import sensor_msgs_py.point_cloud2 as pc2
 from px4_msgs.msg import VehicleLocalPosition, VehicleAttitude
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Odometry
 from geometry_msgs.msg import Point, Quaternion
 
 class OccupancyPublisher(Node):
@@ -60,9 +60,12 @@ class OccupancyPublisher(Node):
         # ---- subscriptions ----
         self.create_subscription(PointCloud2,
             '/voa_pc_out', self.pc_callback, qos_profile=pc_qos)
-        self.create_subscription(VehicleLocalPosition,
-            '/fmu/out/vehicle_local_position',
-            self.position_callback, qos_profile=px4_qos)
+        # self.create_subscription(VehicleLocalPosition,
+        #     '/fmu/out/vehicle_local_position',
+        #     self.position_callback, qos_profile=px4_qos)
+        self.create_subscription(Odometry,
+            '/local_position_odom',
+            self.position_callback, 10)
         self.create_subscription(VehicleAttitude,
             '/fmu/out/vehicle_attitude',
             self.attitude_callback, qos_profile=px4_qos)
@@ -83,10 +86,20 @@ class OccupancyPublisher(Node):
             with self.points_lock:
                 self.latest_points = np.array(pts, dtype=np.float32)
 
-    def position_callback(self, msg: VehicleLocalPosition):
-        # NED → just take x,y
-        self.drone_pos = np.array([msg.x, msg.y, msg.z],
-                                  dtype=np.float32)
+    # def position_callback(self, msg: VehicleLocalPosition):
+    #     # NED → just take x,y
+    #     self.drone_pos = np.array([msg.x, msg.y, msg.z],
+    #                               dtype=np.float32)
+        
+    def position_callback(self, msg: Odometry):
+        # Update the drone's current position
+        # print(f'position message: {msg}')
+        self.drone_pos = (
+            msg.pose.pose.position.x,
+            msg.pose.pose.position.y,
+            msg.pose.pose.position.z
+        )
+
 
     def attitude_callback(self, msg: VehicleAttitude):
         # store quaternion (w,x,y,z)
@@ -110,7 +123,8 @@ class OccupancyPublisher(Node):
                     pts = pts[idx]
 
                 # subtract drone XY position and drop Z
-                body_xy = pts[:, :2]# - self.drone_pos[:2]
+                print(f'drone pos: {self.drone_pos}')
+                body_xy = pts[:, :2] - self.drone_pos[:2]
 
                 # compute yaw from quaternion
                 w, x, y, z = self.att_q
@@ -135,7 +149,7 @@ class OccupancyPublisher(Node):
                     fy, fx,
                     bins=[self.y_edges, self.x_edges]
                 )[0]
-                filt = median_filter(hist, size=7)
+                filt = median_filter(hist, size=3)
                 thresh = filt.mean()
 
                 # occupancy: free=0, occ=100
