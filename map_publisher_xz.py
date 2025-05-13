@@ -11,39 +11,40 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 
 from sensor_msgs.msg import PointCloud2
 import sensor_msgs_py.point_cloud2 as pc2
-from px4_msgs.msg import VehicleLocalPosition, VehicleAttitude
+from px4_msgs.msg import VehicleAttitude, VehicleLocalPosition
 from nav_msgs.msg import OccupancyGrid, Odometry
 from geometry_msgs.msg import Point, Quaternion
 
-class OccupancyPublisher(Node):
+class OccupancyPublisherXZ(Node):
     def __init__(self):
-        super().__init__('occupancy_publisher')
+        super().__init__('occupancy_publisher_xz')
 
         # ---- parameters ----
-        self.ORIGIN_RADIUS = 0.5       # ignore points within this radius (m)
-        self.GRID_BINS    = 40         # cells per axis
-        self.scale        = 10         # pixels per cell for display
+        self.ORIGIN_RADIUS = 0.5        # ignore points within this radius (m)
+        self.GRID_BINS    = 40          # cells per axis
+        self.scale        = 10          # pixels per cell for display
         self.resolution   = 4.0 / self.GRID_BINS  # meters per cell
-        self.X_RANGE      = (0.0, 4.0)             # forward 4 m
-        half_cells = self.GRID_BINS // 2
-        self.Y_RANGE      = (-half_cells * self.resolution,
-                              half_cells * self.resolution)
 
-        # bin edges for histogram2d
+        # X covers [0 … 4] m, Z covers [-2 … +2] m
+        self.X_RANGE = (0.0, 4.0)
+        self.Z_RANGE = (-2.0, 2.0)
+
+        # bin edges for histogram2d: first dim=Z, second dim=X
         self.x_edges = np.linspace(self.X_RANGE[0], self.X_RANGE[1],
                                    self.GRID_BINS + 1)
-        self.y_edges = np.linspace(self.Y_RANGE[0], self.Y_RANGE[1],
+        self.z_edges = np.linspace(self.Z_RANGE[0], self.Z_RANGE[1],
                                    self.GRID_BINS + 1)
 
         # ---- state ----
         self.latest_points = None
         self.points_lock   = threading.Lock()
+        # drone_pos = (x, y, z)
         self.drone_pos     = np.zeros(3, dtype=np.float32)
         self.att_q         = (1.0, 0.0, 0.0, 0.0)  # (w,x,y,z)
 
         # ---- publisher ----
         self.map_pub = self.create_publisher(OccupancyGrid,
-                                             'occupancy_grid', 10)
+                                             'occupancy_grid_xz', 10)
         self.frame_id = 'map'
 
         # ---- QoS ----
@@ -60,28 +61,38 @@ class OccupancyPublisher(Node):
         # ---- subscriptions ----
         self.create_subscription(PointCloud2,
             '/voa_pc_out', self.pc_callback, qos_profile=pc_qos)
-        self.create_subscription(VehicleLocalPosition,
-            '/fmu/out/vehicle_local_position',
-            self.position_callback, qos_profile=px4_qos)
         # self.create_subscription(Odometry,
         #     '/local_position_odom',
         #     self.position_callback, 10)
+        self.create_subscription(VehicleLocalPosition,
+            '/fmu/out/vehicle_local_position',
+            self.position_callback, qos_profile=px4_qos)
         self.create_subscription(VehicleAttitude,
             '/fmu/out/vehicle_attitude',
             self.attitude_callback, qos_profile=px4_qos)
 
         # OpenCV window
-        cv2.namedWindow('Occupancy Grid', cv2.WINDOW_NORMAL)
-        cv2.resizeWindow('Occupancy Grid',
+        cv2.namedWindow('Occupancy Grid XZ', cv2.WINDOW_NORMAL)
+        cv2.resizeWindow('Occupancy Grid XZ',
                         self.GRID_BINS * self.scale,
                         self.GRID_BINS * self.scale)
 
-        # spin callbacks in background
         threading.Thread(target=rclpy.spin, args=(self,), daemon=True).start()
 
     def pc_callback(self, msg: PointCloud2):
+        print(f'message data: {type(msg.data), len(msg.data), msg.data[:20]}')
+
         pts = [(x,y,z) for x,y,z in pc2.read_points(
             msg, field_names=('x','y','z'), skip_nans=True)]
+        print(f'points: {len(pts)}')
+        self.cloud_width  = msg.width
+        self.cloud_height = msg.height
+        self.latest_cloud = np.array(pts).reshape(
+            (msg.height, msg.width, 3)
+        )
+        print(f'cloud width: {self.cloud_width}')
+        print(f'cloud height: {self.cloud_height}')
+        print(f'cloud shape: {self.latest_cloud.shape}')
         if pts:
             with self.points_lock:
                 self.latest_points = np.array(pts, dtype=np.float32)
@@ -90,19 +101,15 @@ class OccupancyPublisher(Node):
         # NED → just take x,y
         self.drone_pos = np.array([msg.x, msg.y, msg.z],
                                   dtype=np.float32)
-        
+
     # def position_callback(self, msg: Odometry):
-    #     # Update the drone's current position
-    #     # print(f'position message: {msg}')
     #     self.drone_pos = (
     #         msg.pose.pose.position.x,
     #         msg.pose.pose.position.y,
     #         msg.pose.pose.position.z
     #     )
 
-
     def attitude_callback(self, msg: VehicleAttitude):
-        # store quaternion (w,x,y,z)
         self.att_q = (msg.q[0], msg.q[1],
                       msg.q[2], msg.q[3])
 
@@ -122,8 +129,8 @@ class OccupancyPublisher(Node):
                                            50000, replace=False)
                     pts = pts[idx]
 
-                # subtract drone XY position and drop Z
-                print(f'drone pos: {self.drone_pos}')
+                # --- transform into world X,Z ---
+                # subtract drone XY for X-axis rotation
                 body_xy = pts[:, :2] - self.drone_pos[:2]
 
                 # compute yaw from quaternion
@@ -131,25 +138,26 @@ class OccupancyPublisher(Node):
                 yaw = np.arctan2(2*(w*z + x*y),
                                  1 - 2*(y*y + z*z))
 
-                # 2×2 rotation matrix
+                # rotate into world XY
                 c, s = np.cos(yaw), np.sin(yaw)
                 R2 = np.array([[ c, -s],
                                [ s,  c]], dtype=np.float32)
-
-                # rotate into world frame
                 world_xy = (R2 @ body_xy.T).T
-                xs, ys = world_xy[:,0], world_xy[:,1]
 
-                # mask out inner radius
-                mask = np.hypot(xs, ys) > self.ORIGIN_RADIUS
-                fx, fy = xs[mask], ys[mask]
+                # world X and world Z
+                xs = world_xy[:,0]
+                zs = pts[:,2] - self.drone_pos[2]
 
-                # histogram & filter
+                # mask out inner radius (in X–Z plane)
+                mask = np.hypot(xs, zs) > self.ORIGIN_RADIUS
+                fx, fz = xs[mask], zs[mask]
+
+                # histogram over Z (rows) × X (cols)
                 hist = np.histogram2d(
-                    fy, fx,
-                    bins=[self.y_edges, self.x_edges]
+                    fz, fx,
+                    bins=[self.z_edges, self.x_edges]
                 )[0]
-                filt = median_filter(hist, size=3)
+                filt   = median_filter(hist, size=3)
                 thresh = filt.mean()
 
                 # occupancy: free=0, occ=100
@@ -164,7 +172,7 @@ class OccupancyPublisher(Node):
                 grid.info.height     = self.GRID_BINS
                 grid.info.origin.position = Point(
                     x=self.X_RANGE[0],
-                    y=self.Y_RANGE[0],
+                    y=self.Z_RANGE[0],  # Z→grid‑Y axis
                     z=0.0
                 )
                 grid.info.origin.orientation = Quaternion(
@@ -173,15 +181,15 @@ class OccupancyPublisher(Node):
                 grid.data = occ.flatten(order='C').tolist()
                 self.map_pub.publish(grid)
 
-                # display in OpenCV
-                img   = (occ > 50).astype(np.uint8) * 255
-                disp  = cv2.resize(
+                # display
+                img  = (occ > 50).astype(np.uint8) * 255
+                disp = cv2.resize(
                     img,
                     (self.GRID_BINS*self.scale,
                      self.GRID_BINS*self.scale),
                     interpolation=cv2.INTER_NEAREST
                 )
-                cv2.imshow('Occupancy Grid', disp)
+                cv2.imshow('Occupancy Grid XZ', disp)
                 cv2.waitKey(1)
 
             time.sleep(dt)
@@ -190,7 +198,7 @@ class OccupancyPublisher(Node):
 
 def main():
     rclpy.init()
-    node = OccupancyPublisher()
+    node = OccupancyPublisherXZ()
     try:
         node.run()
     except KeyboardInterrupt:

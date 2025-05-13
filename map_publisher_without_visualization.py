@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 
-import threading, time
+import threading
+import time
 import numpy as np
 from scipy.ndimage import median_filter
-import cv2
 
 import rclpy
 from rclpy.node import Node
@@ -11,7 +11,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 
 from sensor_msgs.msg import PointCloud2
 import sensor_msgs_py.point_cloud2 as pc2
-from px4_msgs.msg import VehicleLocalPosition, VehicleAttitude
+from px4_msgs.msg import VehicleAttitude
 from nav_msgs.msg import OccupancyGrid, Odometry
 from geometry_msgs.msg import Point, Quaternion
 
@@ -22,7 +22,7 @@ class OccupancyPublisher(Node):
         # ---- parameters ----
         self.ORIGIN_RADIUS = 0.5       # ignore points within this radius (m)
         self.GRID_BINS    = 40         # cells per axis
-        self.scale        = 10         # pixels per cell for display
+        self.scale        = 10         # pixels per cell for display (unused now)
         self.resolution   = 4.0 / self.GRID_BINS  # meters per cell
         self.X_RANGE      = (0.0, 4.0)             # forward 4 m
         half_cells = self.GRID_BINS // 2
@@ -60,21 +60,12 @@ class OccupancyPublisher(Node):
         # ---- subscriptions ----
         self.create_subscription(PointCloud2,
             '/voa_pc_out', self.pc_callback, qos_profile=pc_qos)
-        self.create_subscription(VehicleLocalPosition,
-            '/fmu/out/vehicle_local_position',
-            self.position_callback, qos_profile=px4_qos)
-        # self.create_subscription(Odometry,
-        #     '/local_position_odom',
-        #     self.position_callback, 10)
+        self.create_subscription(Odometry,
+            '/local_position_odom',
+            self.position_callback, 10)
         self.create_subscription(VehicleAttitude,
             '/fmu/out/vehicle_attitude',
             self.attitude_callback, qos_profile=px4_qos)
-
-        # OpenCV window
-        cv2.namedWindow('Occupancy Grid', cv2.WINDOW_NORMAL)
-        cv2.resizeWindow('Occupancy Grid',
-                        self.GRID_BINS * self.scale,
-                        self.GRID_BINS * self.scale)
 
         # spin callbacks in background
         threading.Thread(target=rclpy.spin, args=(self,), daemon=True).start()
@@ -86,20 +77,13 @@ class OccupancyPublisher(Node):
             with self.points_lock:
                 self.latest_points = np.array(pts, dtype=np.float32)
 
-    def position_callback(self, msg: VehicleLocalPosition):
-        # NED → just take x,y
-        self.drone_pos = np.array([msg.x, msg.y, msg.z],
-                                  dtype=np.float32)
-        
-    # def position_callback(self, msg: Odometry):
-    #     # Update the drone's current position
-    #     # print(f'position message: {msg}')
-    #     self.drone_pos = (
-    #         msg.pose.pose.position.x,
-    #         msg.pose.pose.position.y,
-    #         msg.pose.pose.position.z
-    #     )
-
+    def position_callback(self, msg: Odometry):
+        # Update the drone's current position
+        self.drone_pos = (
+            msg.pose.pose.position.x,
+            msg.pose.pose.position.y,
+            msg.pose.pose.position.z
+        )
 
     def attitude_callback(self, msg: VehicleAttitude):
         # store quaternion (w,x,y,z)
@@ -123,7 +107,6 @@ class OccupancyPublisher(Node):
                     pts = pts[idx]
 
                 # subtract drone XY position and drop Z
-                print(f'drone pos: {self.drone_pos}')
                 body_xy = pts[:, :2] - self.drone_pos[:2]
 
                 # compute yaw from quaternion
@@ -173,20 +156,7 @@ class OccupancyPublisher(Node):
                 grid.data = occ.flatten(order='C').tolist()
                 self.map_pub.publish(grid)
 
-                # display in OpenCV
-                img   = (occ > 50).astype(np.uint8) * 255
-                disp  = cv2.resize(
-                    img,
-                    (self.GRID_BINS*self.scale,
-                     self.GRID_BINS*self.scale),
-                    interpolation=cv2.INTER_NEAREST
-                )
-                cv2.imshow('Occupancy Grid', disp)
-                cv2.waitKey(1)
-
             time.sleep(dt)
-
-        cv2.destroyAllWindows()
 
 def main():
     rclpy.init()
@@ -197,7 +167,6 @@ def main():
         pass
     finally:
         rclpy.shutdown()
-        cv2.destroyAllWindows()
 
 if __name__ == '__main__':
     main()
