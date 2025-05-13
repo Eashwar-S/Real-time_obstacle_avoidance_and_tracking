@@ -20,13 +20,13 @@ class OccupancyPublisherXZ(Node):
         super().__init__('occupancy_publisher_xz')
 
         # ---- parameters ----
-        self.ORIGIN_RADIUS = 0.5        # ignore points within this radius (m)
+        self.ORIGIN_RADIUS = 0.3        # ignore points within this radius (m)
         self.GRID_BINS    = 40          # cells per axis
         self.scale        = 10          # pixels per cell for display
         self.resolution   = 4.0 / self.GRID_BINS  # meters per cell
 
         # X covers [0 … 4] m, Z covers [-2 … +2] m
-        self.X_RANGE = (0.0, 4.0)
+        self.X_RANGE = (0.0, 2.0)
         self.Z_RANGE = (-2.0, 2.0)
 
         # bin edges for histogram2d: first dim=Z, second dim=X
