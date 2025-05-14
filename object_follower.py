@@ -1,5 +1,55 @@
 #!/usr/bin/env python3
 
+"""
+YoloV8Follower Node
+
+Usage:
+ 1. Source your ROS2 and workspace installs:
+      source /opt/ros/<distro>/setup.bash
+      source ~/your_ws/install/setup.bash
+
+ 2. Install Python dependencies:
+      pip install ultralytics opencv-python
+
+ 3. Ensure ROS2 packages:
+      sudo apt install ros-<distro>-cv-bridge ros-<distro>-px4-msgs
+
+ 4. Build & source your workspace:
+      colcon build --packages-select <your_package>
+      source install/setup.bash
+
+ 5. Launch PX4 (SITL or hardware) and wait for vehicle to connect.
+
+ 6. Run this node:
+      ros2 run <your_package> object_follower.py
+
+ 7. Focus the `Detections` window, press a number key (0-9) to select a detected object.
+
+ 8. Arm & switch to OFFBOARD:
+    • In QGroundControl: click ARM then set mode to OFFBOARD, or
+    • Uncomment `node.arm_and_offboard()` in `main()` to have the node send VehicleCommand.
+
+Once armed and in OFFBOARD, the drone will yaw to center the chosen detection and adjust position.
+
+Topics:
+ • Subscribes:
+    - /image_rect/compressed       (sensor_msgs/msg/CompressedImage)
+    - /fmu/out/vehicle_local_position (px4_msgs/msg/VehicleLocalPosition)
+    - /fmu/out/vehicle_status        (px4_msgs/msg/VehicleStatus)
+    - /fmu/out/vehicle_control_mode  (px4_msgs/msg/VehicleControlMode)
+
+ • Publishes:
+    - /fmu/in/trajectory_setpoint   (px4_msgs/msg/TrajectorySetpoint)
+    - /fmu/in/offboard_control_mode (px4_msgs/msg/OffboardControlMode)
+    - /fmu/in/vehicle_command       (px4_msgs/msg/VehicleCommand)
+    - /image_rect/yolo_annotated     (sensor_msgs/msg/Image)
+
+Parameters:
+  - follow_distance (float, default 0.5)  m behind target
+  - hover_height    (float, default -1.0) m offset down
+  - yaw_gain        (float, default 1.0) rad per normalized pixel error
+"""
+
 import math
 import rclpy
 from rclpy.node import Node
