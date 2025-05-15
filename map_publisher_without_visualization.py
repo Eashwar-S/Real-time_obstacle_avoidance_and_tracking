@@ -3,7 +3,8 @@
 import threading
 import time
 import numpy as np
-from scipy.ndimage import median_filter
+import math
+from scipy.ndimage import median_filter, uniform_filter
 
 import rclpy
 from rclpy.node import Node
@@ -11,7 +12,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 
 from sensor_msgs.msg import PointCloud2
 import sensor_msgs_py.point_cloud2 as pc2
-from px4_msgs.msg import VehicleAttitude
+from px4_msgs.msg import VehicleAttitude, VehicleLocalPosition
 from nav_msgs.msg import OccupancyGrid, Odometry
 from geometry_msgs.msg import Point, Quaternion
 
@@ -58,32 +59,58 @@ class OccupancyPublisher(Node):
         )
 
         # ---- subscriptions ----
+        # self.create_subscription(PointCloud2,
+        #     '/voa_pc_out', self.pc_callback, qos_profile=pc_qos)
+        
         self.create_subscription(PointCloud2,
-            '/voa_pc_out', self.pc_callback, qos_profile=pc_qos)
-        self.create_subscription(Odometry,
-            '/local_position_odom',
-            self.position_callback, 10)
+            '/stereo_front_pc', self.pc_callback, qos_profile=pc_qos)
+        # self.create_subscription(Odometry,
+        #     '/local_position_odom',
+        #     self.position_callback, 10)
+        self.create_subscription(VehicleLocalPosition,
+            '/fmu/out/vehicle_local_position',
+            self.position_callback, qos_profile=px4_qos)
         self.create_subscription(VehicleAttitude,
             '/fmu/out/vehicle_attitude',
             self.attitude_callback, qos_profile=px4_qos)
+        
+        
+        β = math.radians(90)
+        R_rot_y = np.array([
+            [ math.cos(β), 0, math.sin(β)],
+            [ 0,           1, 0        ],
+            [-math.sin(β), 0, math.cos(β)]
+        ])
+        alpha = math.radians(90)
+        R_rot_z = np.array([
+            [ math.cos(alpha), -math.sin(alpha), 0],
+            [ math.sin(alpha),  math.cos(alpha), 0],
+            [ 0,            0,           1]
+        ])
+        self.R_cam_to_ned = R_rot_y @ R_rot_z
 
         # spin callbacks in background
         threading.Thread(target=rclpy.spin, args=(self,), daemon=True).start()
 
     def pc_callback(self, msg: PointCloud2):
-        pts = [(x,y,z) for x,y,z in pc2.read_points(
+        pts = [self.R_cam_to_ned @ np.array([x,y,z]) for x,y,z in pc2.read_points(
             msg, field_names=('x','y','z'), skip_nans=True)]
         if pts:
             with self.points_lock:
                 self.latest_points = np.array(pts, dtype=np.float32)
 
-    def position_callback(self, msg: Odometry):
-        # Update the drone's current position
-        self.drone_pos = (
-            msg.pose.pose.position.x,
-            msg.pose.pose.position.y,
-            msg.pose.pose.position.z
-        )
+    def position_callback(self, msg: VehicleLocalPosition):
+        # NED → just take x,y
+        self.drone_pos = np.array([msg.x, msg.y, msg.z],
+                                  dtype=np.float32)
+
+    # def position_callback(self, msg: Odometry):
+    #     # Update the drone's current position
+    #     self.drone_pos = (
+    #         msg.pose.pose.position.x,
+    #         msg.pose.pose.position.y,
+    #         msg.pose.pose.position.z
+    #     )
 
     def attitude_callback(self, msg: VehicleAttitude):
         # store quaternion (w,x,y,z)
@@ -132,7 +159,8 @@ class OccupancyPublisher(Node):
                     fy, fx,
                     bins=[self.y_edges, self.x_edges]
                 )[0]
-                filt = median_filter(hist, size=3)
+                filt = uniform_filter(hist, size=9)
+                filt = median_filter(filt, size=3)
                 thresh = filt.mean()
 
                 # occupancy: free=0, occ=100

@@ -2,17 +2,18 @@
 
 import rclpy
 from rclpy.node import Node
-from nav_msgs.msg import OccupancyGrid, Path, Odometry
+from nav_msgs.msg import OccupancyGrid, Path
 from geometry_msgs.msg import PoseStamped
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 import numpy as np
+import math
 from px4_msgs.msg import (
     VehicleLocalPosition,
-    VehicleAttitude,
+    VehicleControlMode,
+    VehicleCommand,
+    OffboardControlMode,
     TrajectorySetpoint,
-    VehicleCommand,           # <-- for subscribing to our own commands
-    OffboardControlMode,      # <-- for subscribing to the heartbeat
-    VehicleControlMode,       # <-- to know when OFFBOARD is active
+    VehicleAttitude,
 )
 import heapq
 
@@ -20,46 +21,48 @@ class DijkstraPlanner(Node):
     def __init__(self):
         super().__init__('dijkstra_planner')
 
-        # --- QoS for PX4 topics ---
         px4_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST, depth=1,
             durability=DurabilityPolicy.TRANSIENT_LOCAL
         )
 
-        # state flags
+        # state
         self.offboard_enabled = False
-        self.last_cmd        = None
+        self.drone_position  = None
+        self.att_q           = (1.0, 0.0, 0.0, 0.0)  # quaternion (w,x,y,z)
 
-        # subscribe to current vehicle position
+        # subscribe to drone position and attitude
         self.create_subscription(
             VehicleLocalPosition,
             '/fmu/out/vehicle_local_position',
             self.position_callback,
             qos_profile=px4_qos
         )
+        self.create_subscription(
+            VehicleAttitude,
+            '/fmu/out/vehicle_attitude',
+            self.attitude_callback,
+            qos_profile=px4_qos
+        )
 
-        # subscribe to PX4 control‑mode to check OFFBOARD status
+        # subscribe to OFFBOARD and commands
         self.create_subscription(
             VehicleControlMode,
             '/fmu/out/vehicle_control_mode',
             self.control_mode_callback,
             qos_profile=px4_qos
         )
-
-        # optionally, watch the commands you're sending
         self.create_subscription(
             VehicleCommand,
             '/fmu/in/vehicle_command',
             self.command_callback,
             qos_profile=px4_qos
         )
-
-        # and watch your own offboard‑heartbeat
         self.create_subscription(
             OffboardControlMode,
             '/fmu/in/offboard_control_mode',
-            self.offboard_control_mode_callback,
+            self.offboard_heartbeat_callback,
             qos_profile=px4_qos
         )
 
@@ -71,27 +74,25 @@ class DijkstraPlanner(Node):
             10
         )
 
+        # publishers
         self.offb_ctrl_pub = self.create_publisher(
             OffboardControlMode,
             '/fmu/in/offboard_control_mode',
             px4_qos
         )
-
-        # publisher for the full planned Path
         self.path_pub = self.create_publisher(Path, 'planned_path', 10)
-        # publisher for the first waypoint as a TrajectorySetpoint
         self.sp_pub   = self.create_publisher(
             TrajectorySetpoint,
             '/fmu/in/trajectory_setpoint',
             px4_qos
         )
 
-        self.drone_position = None
-        self.create_timer(0.05, self.publish_offboard_control_heartbeat_signal)
+        # heartbeat timer
+        self.create_timer(0.05, self.publish_offboard_heartbeat)
 
-    def publish_offboard_control_heartbeat_signal(self):
+    def publish_offboard_heartbeat(self):
         msg = OffboardControlMode()
-        msg.position     = True   # enable position+yaw control
+        msg.position     = True
         msg.velocity     = False
         msg.acceleration = False
         msg.attitude     = False
@@ -102,79 +103,103 @@ class DijkstraPlanner(Node):
     def position_callback(self, msg: VehicleLocalPosition):
         self.drone_position = np.array([msg.x, msg.y, msg.z], dtype=np.float32)
 
+    def attitude_callback(self, msg: VehicleAttitude):
+        self.att_q = (msg.q[0], msg.q[1], msg.q[2], msg.q[3])
+
     def control_mode_callback(self, msg: VehicleControlMode):
-        # flag_control_offboard_enabled tells us if PX4 is actually in OFFBOARD
         self.offboard_enabled = bool(msg.flag_control_offboard_enabled)
-        self.get_logger().debug(f"OFFBOARD enabled: {self.offboard_enabled}")
 
     def command_callback(self, msg: VehicleCommand):
-        # keep track of every command you issue
-        self.last_cmd = msg
-        self.get_logger().debug(f"Sent VEHICLE_COMMAND: {msg.command}")
+        # track last command
+        pass
 
-    def offboard_control_mode_callback(self, msg: OffboardControlMode):
-        # see what offboard modes (pos/vel/accel) you have enabled
-        self.get_logger().debug(
-            f"OffboardControlMode → pos:{msg.position} vel:{msg.velocity}"
-        )
+    def offboard_heartbeat_callback(self, msg: OffboardControlMode):
+        # no-op
+        pass
 
     def grid_callback(self, msg: OccupancyGrid):
-        # build a simple cost map
-        h, w   = msg.info.height, msg.info.width
-        res    = msg.info.resolution
-        data   = np.array(msg.data, dtype=np.int8).reshape((h, w))
-        cost   = np.where(data > 50, np.inf, 1.0)
+        # extract grid
+        h, w    = msg.info.height, msg.info.width
+        res     = msg.info.resolution
+        data    = np.array(msg.data, dtype=np.int8).reshape((h, w))
+        cost    = np.where(data > 50, np.inf, 1.0)
 
-        start = (h//2, 0)
-        goal  = (h//2, w-1)
-        path  = self.compute_dijkstra(cost, start, goal)
+        # start: vehicle position in grid frame
+        if self.drone_position is None:
+            start = (h // 2, 0)
+        else:
+            ox = msg.info.origin.position.x
+            oy = msg.info.origin.position.y
+            x, y = self.drone_position[0], self.drone_position[1]
+            col = int((x - ox) / res)
+            row = int((y - oy) / res)
+            col = np.clip(col, 0, w-1)
+            row = np.clip(row, 0, h-1)
+            start = (row, col)
+
+        # goal: same row, right edge
+        goal = (start[0], w-1)
+
+        path = self.compute_dijkstra(cost, start, goal)
         if path is None:
             self.get_logger().warn('No path found')
             return
 
-        # publish the full Path
+        # get grid origin & orientation
+        ox = msg.info.origin.position.x
+        oy = msg.info.origin.position.y
+        qx = msg.info.origin.orientation.x
+        qy = msg.info.origin.orientation.y
+        qz = msg.info.origin.orientation.z
+        qw = msg.info.origin.orientation.w
+        # yaw from grid quaternion
+        yaw0 = math.atan2(2*(qw*qz + qx*qy), 1 - 2*(qy*qy + qz*qz))
+        R0 = np.array([[math.cos(yaw0), -math.sin(yaw0)],
+                       [math.sin(yaw0),  math.cos(yaw0)]])
+
+        # publish full Path rotated into world
         path_msg = Path()
         path_msg.header = msg.header
         for (r, c) in path:
+            local = np.array([(c+0.5)*res, (r+0.5)*res])
+            wx, wy = (R0.dot(local) + np.array([ox, oy]))
             pose = PoseStamped()
             pose.header = msg.header
-            pose.pose.position.x = msg.info.origin.position.x + (c + 0.5) * res
-            pose.pose.position.y = msg.info.origin.position.y + (r + 0.5) * res
+            pose.pose.position.x = float(wx)
+            pose.pose.position.y = float(wy)
             pose.pose.orientation.w = 1.0
             path_msg.poses.append(pose)
         self.path_pub.publish(path_msg)
 
-        # only send a setpoint if PX4 is actually in OFFBOARD
+        # first waypoint setpoint
         if not self.offboard_enabled:
-            self.get_logger().warn("OFFBOARD not active – skipping setpoint publish")
+            self.get_logger().warn('OFFBOARD inactive, skip setpoint')
             return
 
-        # get the first waypoint in world coords
-        first_r, first_c = path[0]
-        first_x = msg.info.origin.position.x + (first_c + 0.5) * res
-        first_y = msg.info.origin.position.y + (first_r + 0.5) * res
-        z_sp    = float(self.drone_position[2]) if self.drone_position is not None else 0.0
+        # compute first world waypoint
+        (r0, c0) = path[0]
+        local0 = np.array([(c0+0.5)*res, (r0+0.5)*res])
+        wx0, wy0 = (R0.dot(local0) + np.array([ox, oy]))
+        z_sp = float(self.drone_position[2]) if self.drone_position is not None else 0.0
 
         sp = TrajectorySetpoint()
         sp.timestamp    = int(self.get_clock().now().nanoseconds / 1000)
-        sp.position     = [first_x, first_y, z_sp]
+        sp.position     = [wx0, wy0, z_sp]
         sp.velocity     = [0.0, 0.0, 0.0]
         sp.acceleration = [0.0, 0.0, 0.0]
         sp.jerk         = [0.0, 0.0, 0.0]
         sp.yaw          = 0.0
         sp.yawspeed     = 0.0
-
         self.sp_pub.publish(sp)
-        self.get_logger().info(f"SP→ X:{first_x:.2f}, Y:{first_y:.2f}, Z:{z_sp:.2f}")
+        self.get_logger().info(f"SP→ X:{wx0:.2f}, Y:{wy0:.2f}, Z:{z_sp:.2f}")
 
     def compute_dijkstra(self, cost, start, goal):
         h, w = cost.shape
-        dist = np.full((h, w), np.inf, dtype=float)
+        dist = np.full((h, w), np.inf)
         prev = {}
         dist[start] = 0.0
         pq = [(0.0, start)]
         dirs = [(-1,0),(1,0),(0,-1),(0,1)]
-
         while pq:
             d, (r, c) = heapq.heappop(pq)
             if (r, c) == goal:
@@ -182,23 +207,22 @@ class DijkstraPlanner(Node):
             if d > dist[r, c]:
                 continue
             for dr, dc in dirs:
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < h and 0 <= nc < w and cost[nr, nc] < np.inf:
-                    nd = d + cost[nr, nc]
-                    if nd < dist[nr, nc]:
-                        dist[nr, nc] = nd
-                        prev[(nr, nc)] = (r, c)
-                        heapq.heappush(pq, (nd, (nr, nc)))
-
+                nr, nc = r+dr, c+dc
+                if 0 <= nr < h and 0 <= nc < w and cost[nr,nc] < np.inf:
+                    nd = d + cost[nr,nc]
+                    if nd < dist[nr,nc]:
+                        dist[nr,nc] = nd
+                        prev[(nr,nc)] = (r, c)
+                        heapq.heappush(pq, (nd, (nr,nc)))
         if dist[goal] == np.inf:
             return None
-
         path = [goal]
-        cur  = goal
+        cur = goal
         while cur != start:
             cur = prev[cur]
             path.append(cur)
         return list(reversed(path))
+
 
 def main():
     rclpy.init()
