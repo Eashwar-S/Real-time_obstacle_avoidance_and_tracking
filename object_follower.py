@@ -95,7 +95,7 @@ class YoloV8Follower(Node):
 
         # --- pixel → meter gains (tune these!) ---
         self.K_LAT  = 0.1   # lateral (east) gain
-        self.K_VERT = 0.001 # vertical (down) gain
+        self.K_VERT = 0.0001 # vertical (down) gain
         self.K_FWD  = 0.1   # forward (north) gain
 
         # --- QoS for PX4 topics ---
