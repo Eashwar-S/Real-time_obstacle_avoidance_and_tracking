@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 
-import threading, time
+import threading
+import time
 import numpy as np
-from scipy.ndimage import median_filter
+from scipy.ndimage import median_filter, uniform_filter
 import cv2
 
 import rclpy
@@ -12,7 +13,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from sensor_msgs.msg import PointCloud2
 import sensor_msgs_py.point_cloud2 as pc2
 from px4_msgs.msg import VehicleAttitude, VehicleLocalPosition
-from nav_msgs.msg import OccupancyGrid, Odometry
+from nav_msgs.msg import OccupancyGrid
 from geometry_msgs.msg import Point, Quaternion
 
 class OccupancyPublisherXZ(Node):
@@ -25,12 +26,12 @@ class OccupancyPublisherXZ(Node):
         self.scale        = 10          # pixels per cell for display
         self.resolution   = 4.0 / self.GRID_BINS  # meters per cell
 
-        # X covers [0 … 4] m, Z covers [-2 … +2] m
-        self.X_RANGE = (0.0, 2.0)
+        # Y covers [-4 … +4] m, Z covers [-4 … +4] m
+        self.Y_RANGE = (-2.0, 2.0)
         self.Z_RANGE = (-2.0, 2.0)
 
-        # bin edges for histogram2d: first dim=Z, second dim=X
-        self.x_edges = np.linspace(self.X_RANGE[0], self.X_RANGE[1],
+        # bin edges for histogram2d: first dim=Z, second dim=Y
+        self.y_edges = np.linspace(self.Y_RANGE[0], self.Y_RANGE[1],
                                    self.GRID_BINS + 1)
         self.z_edges = np.linspace(self.Z_RANGE[0], self.Z_RANGE[1],
                                    self.GRID_BINS + 1)
@@ -61,9 +62,6 @@ class OccupancyPublisherXZ(Node):
         # ---- subscriptions ----
         self.create_subscription(PointCloud2,
             '/voa_pc_out', self.pc_callback, qos_profile=pc_qos)
-        # self.create_subscription(Odometry,
-        #     '/local_position_odom',
-        #     self.position_callback, 10)
         self.create_subscription(VehicleLocalPosition,
             '/fmu/out/vehicle_local_position',
             self.position_callback, qos_profile=px4_qos)
@@ -72,42 +70,24 @@ class OccupancyPublisherXZ(Node):
             self.attitude_callback, qos_profile=px4_qos)
 
         # OpenCV window
-        cv2.namedWindow('Occupancy Grid XZ', cv2.WINDOW_NORMAL)
-        cv2.resizeWindow('Occupancy Grid XZ',
+        cv2.namedWindow('Occupancy Grid YZ', cv2.WINDOW_NORMAL)
+        cv2.resizeWindow('Occupancy Grid YZ',
                         self.GRID_BINS * self.scale,
                         self.GRID_BINS * self.scale)
 
         threading.Thread(target=rclpy.spin, args=(self,), daemon=True).start()
 
     def pc_callback(self, msg: PointCloud2):
-        print(f'message data: {type(msg.data), len(msg.data), msg.data[:20]}')
-
-        pts = [(x,y,z) for x,y,z in pc2.read_points(
+        pts = [(x, y, z) for x, y, z in pc2.read_points(
             msg, field_names=('x','y','z'), skip_nans=True)]
-        print(f'points: {len(pts)}')
-        self.cloud_width  = msg.width
-        self.cloud_height = msg.height
-        self.latest_cloud = np.array(pts).reshape(
-            (msg.height, msg.width, 3)
-        )
-        print(f'cloud width: {self.cloud_width}')
-        print(f'cloud height: {self.cloud_height}')
-        print(f'cloud shape: {self.latest_cloud.shape}')
         if pts:
             with self.points_lock:
                 self.latest_points = np.array(pts, dtype=np.float32)
 
     def position_callback(self, msg: VehicleLocalPosition):
-        # NED → just take x,y
+        # NED → just take x,y,z
         self.drone_pos = np.array([msg.x, msg.y, msg.z],
                                   dtype=np.float32)
-
-    # def position_callback(self, msg: Odometry):
-    #     self.drone_pos = (
-    #         msg.pose.pose.position.x,
-    #         msg.pose.pose.position.y,
-    #         msg.pose.pose.position.z
-    #     )
 
     def attitude_callback(self, msg: VehicleAttitude):
         self.att_q = (msg.q[0], msg.q[1],
@@ -123,14 +103,14 @@ class OccupancyPublisherXZ(Node):
                        else self.latest_points.copy())
 
             if pts is not None and pts.size:
-                # down‑sample
+                # down‑sample if too large
                 if pts.shape[0] > 50000:
                     idx = np.random.choice(pts.shape[0],
                                            50000, replace=False)
                     pts = pts[idx]
 
-                # --- transform into world X,Z ---
-                # subtract drone XY for X-axis rotation
+                # --- transform points into world XY and Z ---
+                # subtract drone horizontal position for rotation
                 body_xy = pts[:, :2] - self.drone_pos[:2]
 
                 # compute yaw from quaternion
@@ -144,23 +124,30 @@ class OccupancyPublisherXZ(Node):
                                [ s,  c]], dtype=np.float32)
                 world_xy = (R2 @ body_xy.T).T
 
-                # world X and world Z
-                xs = world_xy[:,0]
-                zs = pts[:,2] - self.drone_pos[2]
+                # world coordinates
+                wx = world_xy[:, 0]                   # X axis
+                wy = world_xy[:, 1]                   # Y axis
+                wz = pts[:, 2] - self.drone_pos[2]    # Z axis
 
-                # mask out inner radius (in X–Z plane)
-                mask = np.hypot(xs, zs) > self.ORIGIN_RADIUS
-                fx, fz = xs[mask], zs[mask]
+                # mask out points too close
+                mask = np.hypot(wx, wy) > self.ORIGIN_RADIUS
+                fx, fy, fz = wx[mask], wy[mask], wz[mask]
 
-                # histogram over Z (rows) × X (cols)
+                # compute centroid in world XY plane
+                cx_world = fx.mean()
+                cy_world = fy.mean()
+                depth = float(np.hypot(cx_world, cy_world))
+
+                # histogram for occupancy in Z–Y plane
                 hist = np.histogram2d(
-                    fz, fx,
-                    bins=[self.z_edges, self.x_edges]
+                    fz, fy,
+                    bins=[self.z_edges, self.y_edges]
                 )[0]
-                filt   = median_filter(hist, size=3)
+                # filt   = median_filter(hist, size=7)
+                # filt   = uniform_filter(hist, size=7)
+                filt = uniform_filter(hist, size=9)
+                filt = median_filter(filt, size=3)
                 thresh = filt.mean()
-
-                # occupancy: free=0, occ=100
                 occ = (filt > thresh).astype(np.int8) * 100
 
                 # publish OccupancyGrid
@@ -171,7 +158,7 @@ class OccupancyPublisherXZ(Node):
                 grid.info.width      = self.GRID_BINS
                 grid.info.height     = self.GRID_BINS
                 grid.info.origin.position = Point(
-                    x=self.X_RANGE[0],
+                    x=self.Y_RANGE[0],
                     y=self.Z_RANGE[0],  # Z→grid‑Y axis
                     z=0.0
                 )
@@ -181,15 +168,41 @@ class OccupancyPublisherXZ(Node):
                 grid.data = occ.flatten(order='C').tolist()
                 self.map_pub.publish(grid)
 
-                # display
-                img  = (occ > 50).astype(np.uint8) * 255
-                disp = cv2.resize(
-                    img,
-                    (self.GRID_BINS*self.scale,
-                     self.GRID_BINS*self.scale),
+                # --- display with centroid overlay ---
+                binary = (occ > 50).astype(np.uint8)
+                img_gray = binary * 255
+                disp_gray = cv2.resize(
+                    img_gray,
+                    (self.GRID_BINS * self.scale,
+                     self.GRID_BINS * self.scale),
                     interpolation=cv2.INTER_NEAREST
                 )
-                cv2.imshow('Occupancy Grid XZ', disp)
+
+                # compute centroid of the blob in the grid
+                M = cv2.moments(binary)
+                if M['m00'] > 0:
+                    # grid‑cell centroid (cols=Y, rows=Z)
+                    cx_cell = M['m10'] / M['m00']
+                    cy_cell = M['m01'] / M['m00']
+
+                    # pixel coords
+                    px = int((cx_cell + 0.5) * self.scale)
+                    py = int((cy_cell + 0.5) * self.scale)
+
+                    disp_color = cv2.cvtColor(disp_gray, cv2.COLOR_GRAY2BGR)
+                    # draw red dot at centroid
+                    cv2.circle(disp_color, (px, py), radius=5,
+                               color=(0, 0, 255), thickness=-1)
+                    # annotate with XY‐depth
+                    cv2.putText(disp_color,
+                                f"{depth:.2f} m",
+                                (px + 10, py - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.5, (0, 0, 255), 1)
+                    cv2.imshow('Occupancy Grid YZ', disp_color)
+                else:
+                    cv2.imshow('Occupancy Grid YZ', disp_gray)
+
                 cv2.waitKey(1)
 
             time.sleep(dt)
