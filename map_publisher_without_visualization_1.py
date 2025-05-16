@@ -21,7 +21,7 @@ class OccupancyPublisher(Node):
         super().__init__('occupancy_publisher')
 
         # ---- parameters ----
-        self.ORIGIN_RADIUS = 0.5       # ignore points within this radius (m)
+        self.ORIGIN_RADIUS = 1.0       # ignore points within this radius (m)
         self.GRID_BINS    = 40         # cells per axis
         self.resolution   = 4.0 / self.GRID_BINS  # meters per cell
         self.X_RANGE      = (0.0, 4.0)             # forward 4 m
@@ -74,10 +74,10 @@ class OccupancyPublisher(Node):
             [ 0,           1, 0        ],
             [-math.sin(β), 0, math.cos(β)]
         ])
-        alpha = math.radians(90)
+        α = math.radians(90)
         R_rot_z = np.array([
-            [ math.cos(alpha), -math.sin(alpha), 0],
-            [ math.sin(alpha),  math.cos(alpha), 0],
+            [ math.cos(α), -math.sin(α), 0],
+            [ math.sin(α),  math.cos(α), 0],
             [ 0,            0,           1]
         ])
         self.R_cam_to_ned = R_rot_y @ R_rot_z
@@ -147,9 +147,9 @@ class OccupancyPublisher(Node):
                     fy, fx,
                     bins=[self.y_edges, self.x_edges]
                 )[0]
-                filt = hist
-                # filt = uniform_filter(hist, size=9)
-                # filt = median_filter(filt, size=3)
+                
+                #filt = uniform_filter(hist, size=5)
+                filt = median_filter(hist, size=3)
                 thresh = filt.mean()
                 occ = (filt > thresh).astype(np.int8) * 100
 
