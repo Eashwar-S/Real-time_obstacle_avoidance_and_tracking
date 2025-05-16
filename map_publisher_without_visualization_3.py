@@ -4,8 +4,8 @@ import threading
 import time
 import numpy as np
 import math
-from scipy.ndimage import median_filter, uniform_filter
-
+from scipy.ndimage import median_filter, uniform_filter, binary_dilation
+from sklearn.cluster import DBSCAN
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
@@ -24,13 +24,21 @@ class OccupancyPublisher(Node):
         self.ORIGIN_RADIUS = 0.5       # ignore points within this radius (m)
         self.GRID_BINS    = 40         # cells per axis
         self.resolution   = 4.0 / self.GRID_BINS  # meters per cell
-        # body-frame window in front of the drone
-        self.X_RANGE      = (0.0, 4.0)
+        self.X_RANGE      = (0.0, 4.0)             # forward 4 m
         half = self.GRID_BINS // 2
         self.Y_RANGE      = (-half * self.resolution,
-                             half * self.resolution)
+                              half * self.resolution)
 
-        # bin edges for histogram2d
+        # padding parameter: number of cells to pad around each obstacle
+        self.declare_parameter('padding', 2)
+        self.padding = self.get_parameter('padding').value
+
+        # clustering parameters
+        self.MIN_POINTS_PER_CLUSTER = 30  # minimum points to keep a cluster
+        self.DBSCAN_EPS = 0.2             # max distance (m) between points in a cluster
+        self.MIN_POINTS_PER_CELL = 5      # minimum points to consider a cell occupied
+
+        # edges for histogram2d
         self.x_edges = np.linspace(self.X_RANGE[0], self.X_RANGE[1],
                                    self.GRID_BINS + 1)
         self.y_edges = np.linspace(self.Y_RANGE[0], self.Y_RANGE[1],
@@ -68,7 +76,7 @@ class OccupancyPublisher(Node):
             '/fmu/out/vehicle_attitude',
             self.attitude_callback, qos_profile=px4_qos)
 
-        # camera→NED rotation (unchanged)
+        # camera→NED fixed rotation
         β = math.radians(90)
         R_rot_y = np.array([
             [ math.cos(β), 0, math.sin(β)],
@@ -87,17 +95,19 @@ class OccupancyPublisher(Node):
                          args=(self,), daemon=True).start()
 
     def pc_callback(self, msg: PointCloud2):
-        # rotate from camera into NED once, then keep it in body frame
-        pts = [self.R_cam_to_ned @ np.array([x,y,z]) 
-               for x,y,z in pc2.read_points(msg,
-                                            field_names=('x','y','z'),
-                                            skip_nans=True)]
+        # rotate from camera into NED once
+        pts = [
+            self.R_cam_to_ned @ np.array([x, y, z])
+            for x, y, z in pc2.read_points(
+                msg, field_names=('x','y','z'), skip_nans=True
+            )
+        ]
         if pts:
             with self.points_lock:
                 self.latest_points = np.array(pts, dtype=np.float32)
 
     def position_callback(self, msg: VehicleLocalPosition):
-        # NED → just take x,y,z
+        # store current NED position
         self.drone_pos = np.array([msg.x, msg.y, msg.z],
                                   dtype=np.float32)
 
@@ -116,39 +126,71 @@ class OccupancyPublisher(Node):
                        else self.latest_points.copy())
 
             if pts is not None and pts.size:
-                # down‑sample if needed
+                # down-sample if needed
                 if pts.shape[0] > 50000:
                     idx = np.random.choice(pts.shape[0],
                                            50000, replace=False)
                     pts = pts[idx]
 
-                # **NO rotation** of points here—just translate into body XY
-                body_xy = pts[:, :2] - self.drone_pos[:2]
-                xs, ys = body_xy[:,0], body_xy[:,1]
+                # 1) compute relative vectors in NED body frame
+                rel_xy = pts[:, :2] - self.drone_pos[:2]
 
-                # mask out near‐drone
-                mask = np.hypot(xs, ys) > self.ORIGIN_RADIUS
-                fx, fy = xs[mask], ys[mask]
-
-                # build & filter occupancy
-                hist = np.histogram2d(
-                    fy, fx,
-                    bins=[self.y_edges, self.x_edges]
-                )[0]
-                filt = uniform_filter(hist, size=9)
-                filt = median_filter(filt, size=3)
-                thresh = filt.mean()
-                occ = (filt > thresh).astype(np.int8) * 100
-
-                # compute drone yaw and rotation matrix for the grid origin
+                # 2) build yaw‐rotation matrix
                 w, x, y, z = self.att_q
                 yaw = math.atan2(2*(w*z + x*y),
                                  1 - 2*(y*y + z*z))
                 c, s = math.cos(yaw), math.sin(yaw)
-                R2 = np.array([[ c, -s],
-                               [ s,  c]], dtype=np.float32)
+                R2 = np.array([[c, -s],
+                               [s,  c]], dtype=np.float32)
 
-                # ---- publish grid WITH moving origin & yaw ----
+                # 3) rotate about drone, then translate back into world
+                rot_xy   = rel_xy  # (R2 @ rel_xy.T).T  # if you want world-aligned
+                world_xy = rot_xy + self.drone_pos[:2]
+
+                # 4) mask out anything too close
+                mask = np.hypot(rot_xy[:,0], rot_xy[:,1]) > self.ORIGIN_RADIUS
+
+                rot_xy = world_xy[mask]
+
+                # 5) cluster points with DBSCAN to remove noise
+                if rot_xy.shape[0] > 0:
+                    db = DBSCAN(eps=self.DBSCAN_EPS, min_samples=5).fit(rot_xy)
+                    labels = db.labels_
+                    # keep points in valid clusters (not noise, and large enough)
+                    unique_labels, counts = np.unique(labels[labels != -1], return_counts=True)
+                    valid_labels = unique_labels[counts >= self.MIN_POINTS_PER_CLUSTER]
+                    valid_mask = np.isin(labels, valid_labels)
+                    rot_xy = rot_xy[valid_mask]
+                else:
+                    rot_xy = np.empty((0, 2), dtype=np.float32)
+
+                # 6) histogram & filtering
+                if rot_xy.shape[0] > 0:
+
+                    fx, fy = rot_xy[mask,0], rot_xy[mask,1]
+
+                    # 5) histogram & filtering
+                    hist = np.histogram2d(
+                        fy, fx,
+                        bins=[self.y_edges, self.x_edges]
+                    )[0]
+                    filt = hist
+                    # filt = uniform_filter(hist, size=9)
+                    filt = median_filter(filt, size=3)
+                    thresh = filt.mean()
+                    occ_binary = filt > thresh
+                
+                else:
+                    occ_binary = np.zeros((self.GRID_BINS, self.GRID_BINS), dtype=bool)
+
+                # 6) pad obstacles with dilation
+                struct = np.ones((2*self.padding + 1, 2*self.padding + 1), dtype=bool)
+                occ_padded = binary_dilation(occ_binary, structure=struct)
+
+                # convert to occupancy values [0,100]
+                occ = occ_padded.astype(np.int8) * 100
+
+                # ---- publish grid with moving origin & yaw ----
                 grid = OccupancyGrid()
                 grid.header.stamp = self.get_clock().now().to_msg()
                 grid.header.frame_id = self.frame_id
@@ -156,7 +198,7 @@ class OccupancyPublisher(Node):
                 grid.info.width      = self.GRID_BINS
                 grid.info.height     = self.GRID_BINS
 
-                # 1) world‐frame origin moves with drone + offset
+                # grid origin = drone + rotated offset
                 offset = np.array([self.X_RANGE[0], self.Y_RANGE[0]])
                 origin_xy = self.drone_pos[:2] + (R2 @ offset)
                 grid.info.origin.position = Point(
@@ -165,14 +207,11 @@ class OccupancyPublisher(Node):
                     z=0.0
                 )
 
-                # 2) rotate grid axes by drone yaw only
+                # rotate grid axes by current yaw
                 qz = math.sin(yaw/2.0)
                 qw = math.cos(yaw/2.0)
                 grid.info.origin.orientation = Quaternion(
-                    x=0.0,
-                    y=0.0,
-                    z=qz,
-                    w=qw
+                    x=0.0, y=0.0, z=qz, w=qw
                 )
 
                 grid.data = occ.flatten(order='C').tolist()
