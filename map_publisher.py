@@ -2,7 +2,7 @@
 
 import threading, time
 import numpy as np
-from scipy.ndimage import median_filter
+from scipy.ndimage import median_filter, uniform_filter
 import cv2
 
 import rclpy
@@ -12,7 +12,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from sensor_msgs.msg import PointCloud2
 import sensor_msgs_py.point_cloud2 as pc2
 from px4_msgs.msg import VehicleLocalPosition, VehicleAttitude
-from nav_msgs.msg import OccupancyGrid
+from nav_msgs.msg import OccupancyGrid, Odometry
 from geometry_msgs.msg import Point, Quaternion
 
 class OccupancyPublisher(Node):
@@ -22,7 +22,7 @@ class OccupancyPublisher(Node):
         # ---- parameters ----
         self.ORIGIN_RADIUS = 0.5       # ignore points within this radius (m)
         self.GRID_BINS    = 40         # cells per axis
-        self.scale        = 10         # pixels per cell for display
+        self.scale  = 10         # pixels per cell for display
         self.resolution   = 4.0 / self.GRID_BINS  # meters per cell
         self.X_RANGE      = (0.0, 4.0)             # forward 4 m
         half_cells = self.GRID_BINS // 2
@@ -63,6 +63,9 @@ class OccupancyPublisher(Node):
         self.create_subscription(VehicleLocalPosition,
             '/fmu/out/vehicle_local_position',
             self.position_callback, qos_profile=px4_qos)
+        # self.create_subscription(Odometry,
+        #     '/local_position_odom',
+        #     self.position_callback, 10)
         self.create_subscription(VehicleAttitude,
             '/fmu/out/vehicle_attitude',
             self.attitude_callback, qos_profile=px4_qos)
@@ -77,7 +80,7 @@ class OccupancyPublisher(Node):
         threading.Thread(target=rclpy.spin, args=(self,), daemon=True).start()
 
     def pc_callback(self, msg: PointCloud2):
-        pts = [(x,y,z) for x,y,z in pc2.read_points(
+        pts = [(x,-y,z) for x,y,z in pc2.read_points(
             msg, field_names=('x','y','z'), skip_nans=True)]
         if pts:
             with self.points_lock:
@@ -87,6 +90,16 @@ class OccupancyPublisher(Node):
         # NED → just take x,y
         self.drone_pos = np.array([msg.x, msg.y, msg.z],
                                   dtype=np.float32)
+        
+    # def position_callback(self, msg: Odometry):
+    #     # Update the drone's current position
+    #     # print(f'position message: {msg}')
+    #     self.drone_pos = (
+    #         msg.pose.pose.position.x,
+    #         msg.pose.pose.position.y,
+    #         msg.pose.pose.position.z
+    #     )
+
 
     def attitude_callback(self, msg: VehicleAttitude):
         # store quaternion (w,x,y,z)
@@ -110,6 +123,7 @@ class OccupancyPublisher(Node):
                     pts = pts[idx]
 
                 # subtract drone XY position and drop Z
+                print(f'drone pos: {self.drone_pos}')
                 body_xy = pts[:, :2] - self.drone_pos[:2]
 
                 # compute yaw from quaternion
@@ -135,7 +149,10 @@ class OccupancyPublisher(Node):
                     fy, fx,
                     bins=[self.y_edges, self.x_edges]
                 )[0]
-                filt = median_filter(hist, size=7)
+                # filt = uniform_filter(hist, size=9)
+                # filt = median_filter(filt, size=3)
+                filt = hist
+                # filt = uniform_filter(hist, size=17)
                 thresh = filt.mean()
 
                 # occupancy: free=0, occ=100

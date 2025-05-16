@@ -2,8 +2,10 @@
 
 import rclpy
 from rclpy.node import Node
-from nav_msgs.msg import OccupancyGrid, Path
+from nav_msgs.msg import OccupancyGrid, Path, Odometry
 from geometry_msgs.msg import PoseStamped
+from px4_msgs.msg import VehicleLocalPosition
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 import numpy as np
 import heapq
 import cv2
@@ -16,8 +18,30 @@ class DijkstraPlanner(Node):
         self.window_name = 'Dijkstra Path'
         cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
 
+        self.drone_position = None 
+
+        px4_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST, depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL
+        )
+        # self.create_subscription(VehicleLocalPosition,
+        #     '/fmu/out/vehicle_local_position',
+        #     self.position_callback, qos_profile=px4_qos)
+        self.create_subscription(Odometry,
+            '/local_position_odom',
+            self.position_callback, 10)
         self.create_subscription(OccupancyGrid, 'occupancy_grid', self.grid_callback, 10)
+        
         self.path_pub = self.create_publisher(Path, 'planned_path', 10)
+
+    def position_callback(self, msg: Odometry):
+        # Update the drone's current position
+        self.drone_position = (
+            msg.pose.pose.position.x,
+            msg.pose.pose.position.y
+        )
+
 
     def grid_callback(self, msg: OccupancyGrid):
         h, w   = msg.info.height, msg.info.width
@@ -25,6 +49,9 @@ class DijkstraPlanner(Node):
         data   = np.array(msg.data, dtype=np.int8).reshape((h, w))
 
         cost   = np.where(data > 50, np.inf, 1.0)
+        # if self.drone_position is not None:
+        #     start = (int((self.drone_position[0] - msg.info.origin.position.x) / res * self.scale), int((self.drone_position[1] - msg.info.origin.position.y) / res * self.scale))
+        # else:
         start  = (h//2, 0)
         goal   = (h//2, w-1)
         path   = self.compute_dijkstra(cost, start, goal)
@@ -64,6 +91,12 @@ class DijkstraPlanner(Node):
             pts = np.array([((c+0.5)*self.scale, (r+0.5)*self.scale)
                             for (r, c) in path], dtype=np.int32).reshape(-1,1,2)
             cv2.polylines(disp_color, [pts], False, (0,0,255), 2)
+
+        # Draw the drone's position as a dot
+        if self.drone_position is not None:
+            drone_x = int((self.drone_position[0] - msg.info.origin.position.x) / res * self.scale)
+            drone_y = int((self.drone_position[1] - msg.info.origin.position.y) / res * self.scale)
+            cv2.circle(disp_color, (drone_x, drone_y), 5, (255, 0, 0), -1)
 
         cv2.imshow(self.window_name, disp_color)
         cv2.waitKey(1)
