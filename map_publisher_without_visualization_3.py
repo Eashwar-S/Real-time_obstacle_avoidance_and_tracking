@@ -21,8 +21,8 @@ class OccupancyPublisher(Node):
         super().__init__('occupancy_publisher')
 
         # ---- parameters ----
-        self.ORIGIN_RADIUS = 0.5       # ignore points within this radius (m)
-        self.GRID_BINS    = 40         # cells per axis
+        self.ORIGIN_RADIUS = 0.35       # ignore points within this radius (m)
+        self.GRID_BINS    = 60         # cells per axis
         self.resolution   = 4.0 / self.GRID_BINS  # meters per cell
         self.X_RANGE      = (0.0, 4.0)             # forward 4 m
         half = self.GRID_BINS // 2
@@ -167,7 +167,7 @@ class OccupancyPublisher(Node):
                 # 6) histogram & filtering
                 if rot_xy.shape[0] > 0:
 
-                    fx, fy = rot_xy[mask,0], rot_xy[mask,1]
+                    fx, fy = rot_xy[:,0], rot_xy[:,1]
 
                     # 5) histogram & filtering
                     hist = np.histogram2d(

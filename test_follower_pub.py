@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
 
-"""
-VOXL‑Aided Object Follower Node
-
-Now subscribes to /tflite_data (voxl_msgs/msg/Aidetection) from the VOXL2,
-and uses a terminal prompt to select which class_name to follow.
-"""
-
 import math
 import rclpy
 from rclpy.node import Node
@@ -24,69 +17,52 @@ class VOXLFollower(Node):
     def __init__(self):
         super().__init__('voxl_object_follower')
 
-        # --- user inputs via terminal ---
+        # user inputs
         self.target_class = input("Enter class_name to follow (e.g. 'laptop'): ").strip()
         self.img_w = 1024
         self.img_h = 768
 
-        # --- control gains & state ---
-        self.K_LAT  = 0.5    # east gain
-        self.K_FWD  = 0.5    # north gain (based on area)
-        self.K_VERT = 0.0001 # down gain
-        self.K_YAW  = 1.0    # yaw gain
-        self.desired_area = None
-        self.current_pos  = None
+        # control gains & state
+        self.K_LAT  = 0.3
+        self.K_FWD  = 0.3
+        self.K_VERT = 0.0001
+        self.K_YAW  = 1.0
+        self.desired_area   = None
+        self.current_pos    = None
         self.offboard_enabled = False
 
-        # --- QoS profiles ---
+        # QoS
         from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
         px4_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST, depth=1,
             durability=DurabilityPolicy.TRANSIENT_LOCAL
         )
-
         tf = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST, depth=10,
             durability=DurabilityPolicy.VOLATILE
         )
 
-        # --- subscriptions ---
-        self.create_subscription(
-            Aidetection,
-            '/tflite_data',
-            self.detection_callback,
-            tf
-        )
-        self.create_subscription(
-            VehicleLocalPosition,
-            '/fmu/out/vehicle_local_position',
-            self.local_position_callback,
-            px4_qos
-        )
-        self.create_subscription(
-            VehicleStatus,
-            '/fmu/out/vehicle_status',
-            self.status_callback,
-            px4_qos
-        )
-        self.create_subscription(
-            VehicleControlMode,
-            '/fmu/out/vehicle_control_mode',
-            self.control_mode_callback,
-            px4_qos
-        )
+        # subscriptions
+        self.create_subscription(Aidetection, '/tflite_data', self.detection_callback, tf)
+        self.create_subscription(VehicleLocalPosition, '/fmu/out/vehicle_local_position',
+                                 self.local_position_callback, px4_qos)
+        self.create_subscription(VehicleStatus, '/fmu/out/vehicle_status',
+                                 self.status_callback, px4_qos)
+        self.create_subscription(VehicleControlMode, '/fmu/out/vehicle_control_mode',
+                                 self.control_mode_callback, px4_qos)
 
-        # --- publishers ---
+        # publishers
         self.offb_ctrl_pub = self.create_publisher(
             OffboardControlMode,
             '/fmu/in/offboard_control_mode',
             px4_qos
         )
-        self.sp_pub = self.create_publisher(
+        # now publishing to planner/goal instead of directly to PX4
+        self.goal_pub = self.create_publisher(
             TrajectorySetpoint,
-            '/fmu/in/trajectory_setpoint',
+            '/planner/goal',
             px4_qos
         )
         self.cmd_pub = self.create_publisher(
@@ -98,7 +74,7 @@ class VOXLFollower(Node):
         # heartbeat timer for offboard
         self.create_timer(0.05, self._publish_offboard_heartbeat)
 
-        self.get_logger().info(f"Following class: '{self.target_class}'")
+        self.get_logger().info(f"VOXLFollower ready - following '{self.target_class}'")
 
     def _publish_offboard_heartbeat(self):
         hb = OffboardControlMode()
@@ -121,29 +97,26 @@ class VOXLFollower(Node):
         self.current_pos = msg
 
     def detection_callback(self, msg: Aidetection):
-        # only process if it matches the user-selected class
         if msg.class_name != self.target_class:
             return
 
-        # bounding‐box center & area
         cx = (msg.x_min + msg.x_max) / 2.0
         cy = (msg.y_min + msg.y_max) / 2.0
         area = (msg.x_max - msg.x_min) * (msg.y_max - msg.y_min)
+        print('area =',area)
 
-        # initialize desired area on first detection
         if self.desired_area is None:
             self.desired_area = area
             self.get_logger().info(f"Set desired area = {self.desired_area:.1f}")
 
-        # normalized pixel errors
         ex = (cx - self.img_w/2) / self.img_w
         ey = (cy - self.img_h/2) / self.img_h
 
-        # compute new setpoint relative to current vehicle_local_position
         if self.current_pos is None:
             self.get_logger().warn("No vehicle position yet—skipping setpoint")
             return
 
+        # compute new setpoint
         north_sp = self.current_pos.x + self.K_FWD * ((self.desired_area - area) / self.desired_area)
         east_sp  = self.current_pos.y + self.K_LAT * ex
         down_sp  = self.current_pos.z + self.K_VERT * ey
@@ -151,7 +124,8 @@ class VOXLFollower(Node):
 
         sp = TrajectorySetpoint()
         sp.timestamp    = int(self.get_clock().now().nanoseconds / 1000)
-        sp.position     = [north_sp, east_sp, down_sp]
+        # round each coordinate to 1 decimal place
+        sp.position     = [round(north_sp,1), round(east_sp,1), round(down_sp,1)]
         sp.velocity     = [0.0, 0.0, 0.0]
         sp.acceleration = [0.0, 0.0, 0.0]
         sp.jerk         = [0.0, 0.0, 0.0]
@@ -159,12 +133,12 @@ class VOXLFollower(Node):
         sp.yawspeed     = 0.0
 
         if self.offboard_enabled:
-            self.sp_pub.publish(sp)
+            self.goal_pub.publish(sp)
             self.get_logger().info(
-                f"→ SP: N{north_sp:.2f}, E{east_sp:.2f}, D{down_sp:.2f}, Yaw{desired_yaw:.2f}"
+                f"→ goal [N{sp.position[0]:.1f}, E{sp.position[1]:.1f}, D{sp.position[2]:.1f}]"
             )
         else:
-            self.get_logger().info("OFFBOARD not active, skipping SP")
+            self.get_logger().info("OFFBOARD not active, skipping goal publish")
 
 def main(args=None):
     rclpy.init(args=args)

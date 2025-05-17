@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import math
 import rclpy
 from rclpy.node import Node
 from nav_msgs.msg import OccupancyGrid, Path
@@ -149,7 +150,12 @@ class DijkstraPlanner(Node):
         sp.velocity     = [0.0, 0.0, 0.0]
         sp.acceleration = [0.0, 0.0, 0.0]
         sp.jerk         = [0.0, 0.0, 0.0]
-        sp.yaw          = 0.0
+
+        # set yaw to face the waypoint
+        if self.drone_position is not None:
+            sp.yaw = math.atan2(y - self.drone_position[1], x - self.drone_position[0])
+        else:
+            sp.yaw = 0.0
         sp.yawspeed     = 0.0
         self.sp_pub.publish(sp)
 
@@ -207,7 +213,8 @@ class DijkstraPlanner(Node):
         dist[start] = 0.0
         prev = {}
         pq = [(0.0, start)]
-        dirs = [(-1,0),(1,0),(0,-1),(0,1)]
+        # include 8 motion directions
+        dirs = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]
 
         while pq:
             d, (r, c) = heapq.heappop(pq)
@@ -216,9 +223,11 @@ class DijkstraPlanner(Node):
             if d > dist[r, c]:
                 continue
             for dr, dc in dirs:
-                nr, nc = r+dr, c+dc
+                nr, nc = r + dr, c + dc
                 if 0 <= nr < h and 0 <= nc < w and cost[nr, nc] < np.inf:
-                    nd = d + cost[nr, nc]
+                    # diagonal movements cost sqrt(2)
+                    step = cost[nr, nc] * (math.sqrt(2) if abs(dr) == 1 and abs(dc) == 1 else 1.0)
+                    nd = d + step
                     if nd < dist[nr, nc]:
                         dist[nr, nc] = nd
                         prev[(nr, nc)] = (r, c)
