@@ -172,3 +172,18 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+
+object_tracking_2/
+planner_obs_avoid_bag_rosbag_file/
+planner_obs_avoid_bag_rosbag_file_diag/
+planner_obs_avoid_video_4/
+planner_obs_avoid_video_5/
+object_tracking_obs_avoidance_1/
+object_tracking_obs_avoidance_2/
+object_tracking_obs_avoidance_3/
+object_tracking_obs_avoidance_4/
+object_tracking_obs_avoidance_5/    
+object_tracking_obs_avoidance_6/
+object_tracking_obs_avoidance_7/
+object_tracking_obs_avoidance_8/
