@@ -1,95 +1,60 @@
-# Real-Time Obstacle Avoidance and Tracking
+# Real-Time Object Tracking and Obstacle Avoidance for UAVs
 
-This project implements real-time obstacle avoidance and tracking for drones using the ModalAI VOXL 2 platform. The system leverages depth data obtained from a calibrated stereo camera, processed through the VOXL-DFS server, and converted into ROS 2 nodes using the `voxl_mpa_to_ros2` package. The provided scripts enable the drone to navigate while avoiding obstacles by generating occupancy grids and planning paths.
+An onboard ROS 2 prototype for a ModalAI VOXL-based UAV. It combines stereo depth, a local occupancy grid, Dijkstra path planning, and vision-based target following through PX4 offboard control. The system was developed and evaluated for the ENAE788M final project at the University of Maryland.
 
-## Dependencies
+## Demos
 
-To run this project, you need the following dependenciess:
+**Indoor tracking and obstacle avoidance trial** (about 8 seconds, 4x speed):
 
-1. **ROS 2**: Install ROS 2 (e.g., Humble or Foxy) on your system. Follow the [official installation guide](https://docs.ros.org/en/rolling/Installation.html).
-2. **Python Packages**:
-   - `numpy`
-   - `opencv-python`
-   - `scipy`
-3. **VOXL 2 and VOXL-DFS**:
-   - Ensure the VOXL 2 platform is set up and the stereo camera is calibrated.
-   - Install the `voxl_mpa_to_ros2` package to bridge VOXL data to ROS 2.
+![Indoor trial with person detection](media/indoor_tracking_and_avoidance.gif)
 
-## Setup Instructions
+**Planner simulation with a noisy point-cloud recording** (8 seconds, 4x speed):
 
-1. Inside the drone, navigate to the `voxl_mpa_to_ros2` folder:
-   ```bash
-   cd ~/colcon_ws/src/px4_ros_ws/src/px4_ros_com/src/examples
-   ```
+![Planner simulation](media/planner_simulation.gif)
 
-2. Create a directory for the obstacle avoidance scripts:
-   ```bash
-   mkdir obstacle_avoidance
-   ```
+The full methods, figures, results, and limitations are in the [final project report](ENAE788M_Final_Project.pdf).
 
-3. Copy the following scripts into the `obstacle_avoidance` directory:
-   - `planner.py`
-   - `matrix.py`
-   - `rotated.py`
-   - `map_publisher.py`
+## How it works
 
-   Example command:
-   ```bash
-   cp /path/to/scripts/*.py ~/colcon_ws/src/px4_ros_ws/src/px4_ros_com/src/examples/obstacle_avoidance/
-   ```
+1. Calibrated stereo cameras and `voxl-dfs-server` produce depth and point clouds, bridged to ROS 2 by `voxl_mpa_to_ros2`.
+2. An occupancy publisher filters point-cloud data, marks nearby obstacles in a 2D grid, and pads occupied cells for clearance. The publisher in this repository subscribes to `/voa_pc_out`; the final report describes a later front-stereo input (`/stereo_front_pc`) used for the evaluated grid. Check the topic in your deployed version before running it.
+3. A Dijkstra planner routes through free cells and publishes `/planned_path` for visualization and `/fmu/in/trajectory_setpoint` for PX4 control.
+4. Onboard object detections from `voxl-tflite-server` arrive on `/tflite_data`. The follower converts the selected target's bounding box into a moving goal on `/planner/goal`, which the integrated planner consumes.
 
-4. Update the `CMakeLists.txt` file in `px4_ros_ws/src/px4_ros_com` to include the new scripts. Add the following lines:
-   ```cmake
-   install(PROGRAMS
-     src/examples/obstacle_avoidance/map_publisher.py
-     src/examples/obstacle_avoidance/matrix.py
-     src/examples/obstacle_avoidance/rotated.py
-     src/examples/obstacle_avoidance/planner.py
-   DESTINATION lib/${PROJECT_NAME}
-   )
-   ```
+The repository contains several development variants. `planner.py` demonstrates standalone path planning, while `test_planner_sub.py` accepts a follower goal for the combined pipeline. `test_follower_pub.py` publishes the goal expected by `test_planner_sub.py`. `object_follower.py` and `object_follower_tflite.py` publish setpoints directly to PX4 and are standalone follower variants.
 
-5. Build the workspace:
-   ```bash
-   cd ~/colcon_ws
-   colcon build
-   source install/setup.bash
-   ```
+## Requirements
 
-## Running the Scripts
+- A ROS 2 workspace with `rclpy`, `sensor_msgs`, `nav_msgs`, `geometry_msgs`, `sensor_msgs_py`, `px4_msgs`, and `voxl_msgs` available.
+- Python packages `numpy`, `scipy`, and `opencv-python` for the occupancy publisher and visualization.
+- For onboard use: a configured ModalAI VOXL platform, calibrated stereo cameras, `voxl-dfs-server`, `voxl-tflite-server`, `voxl_mpa_to_ros2`, and PX4 offboard control.
 
-### 1. Start the Map Publisher
-The `map_publisher.py` script generates occupancy grids from the point cloud data and publishes them as ROS 2 messages.
+## Run the ROS 2 nodes
 
-Run the following command:
+Copy the scripts you plan to run into a ROS 2 Python package, make them executable, register them as package executables, and build/source the workspace. The package name and executable names below are examples; adapt them to your installation:
+
 ```bash
+colcon build
+source install/setup.bash
 ros2 run px4_ros_com map_publisher.py
+ros2 run px4_ros_com test_planner_sub.py
+ros2 run px4_ros_com test_follower_pub.py
 ```
 
-### 2. Start the Path Planner
-The `planner.py` script subscribes to the occupancy grid and computes a path using Dijkstra's algorithm.
+Check the live topics before enabling offboard control:
 
-Run the following command:
 ```bash
-ros2 run px4_ros_com planner.py
+ros2 topic list
+ros2 topic echo /occupancy_grid
+ros2 topic echo /planned_path
 ```
 
-### 3. Visualize the Results
-You can visualize the occupancy grid and planned path using tools like `rviz2`:
-```bash
-rviz2
-```
+Use RViz to display `/occupancy_grid` (`nav_msgs/OccupancyGrid`) and `/planned_path` (`nav_msgs/Path`). The `map_publisher.py` variant also opens an OpenCV occupancy-grid window, so it needs a graphical session.
 
-Add the following topics to visualize:
-- `/occupancy_grid` (OccupancyGrid)
-- `/planned_path` (Path)
+## Results and limitations
 
-## Notes
-
-- Ensure the VOXL 2 platform is running and publishing point cloud data to the `/voa_pc_out` topic.
-- The stereo camera must be calibrated, and the depth data should be accurate for proper obstacle avoidance.
-- Adjust parameters like grid resolution and thresholds in the scripts as needed for your specific environment.
+The report documents object tracking in PX4 Gazebo simulation and indoor flight, and obstacle-aware path generation during indoor tests. The combined indoor experiment was less reliable: noisy stereo point clouds caused unstable occupancy grids, intermittent person detections caused goal loss, and high onboard CPU load reduced responsiveness. The report records collisions in that integrated trial. Treat this code as a research prototype, and validate sensing, planning, and failsafes before flight.
 
 ## License
 
-This project is licensed under the MIT License. See the `LICENSE` file for details.
+MIT. See [LICENSE](LICENSE).
